@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -21,7 +22,7 @@ func TestOpenAIGatewayService_APIKeyPassthrough_ImageIntentPreservesGateAndBilli
 		svc := newOpenAIImageGenerationControlTestService(upstream)
 		c, recorder := newOpenAIImageGenerationControlTestContext(false, "curl/8.0")
 		account := newOpenAIImageGenerationControlTestAccount()
-		account.Extra = map[string]any{"openai_passthrough": true}
+		account.Extra = map[string]any{"openai_passthrough": true, openai_compat.ExtraKeyResponsesSupported: true}
 
 		result, err := svc.Forward(context.Background(), c, account, body)
 
@@ -43,7 +44,7 @@ func TestOpenAIGatewayService_APIKeyPassthrough_ImageIntentPreservesGateAndBilli
 		svc := newOpenAIImageGenerationControlTestService(upstream)
 		c, _ := newOpenAIImageGenerationControlTestContext(true, "curl/8.0")
 		account := newOpenAIImageGenerationControlTestAccount()
-		account.Extra = map[string]any{"openai_passthrough": true}
+		account.Extra = map[string]any{"openai_passthrough": true, openai_compat.ExtraKeyResponsesSupported: true}
 
 		result, err := svc.Forward(context.Background(), c, account, body)
 

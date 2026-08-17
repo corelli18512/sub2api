@@ -90,23 +90,17 @@ func selectResponsesProbeModel(account *Account) string {
 	return candidates[0]
 }
 
-// ProbeOpenAIAPIKeyResponsesSupport 探测 OpenAI APIKey 账号上游是否支持
-// /v1/responses 端点，并将结果持久化到 accounts.extra.openai_responses_supported。
+// ProbeOpenAIAPIKeyResponsesSupport probes an OpenAI API-key account's
+// /v1/responses endpoint and stores endpoint-specific diagnostic metadata.
+// It never writes openai_responses_supported: explicit administrator routing
+// configuration always has precedence and probes cannot silently enable an API.
 //
-// 调用时机：账号创建/更新后，且仅当 platform=openai && type=apikey 时。
+// Probe states:
+//   - verified: 2xx with the required function_call output
+//   - unsupported: 404/405/501 or 2xx without the required capability
+//   - degraded: transport/read failures and inconclusive non-2xx responses
 //
-// 探测策略（参见包文档 internal/pkg/openai_compat）：
-//   - 上游 404 / 405 → 端点不存在,写 false
-//   - 上游 2xx → 端点存在,进一步看工具能力:响应含 function_call 输出项才写 true;
-//     仅 reasoning / 无 function_call(如火山方舟 coding/v3 × kimi-k2.6)写 false
-//   - 其他非 2xx（401/422/400/5xx 等）→ 端点存在但无法判定工具能力,保守写 true
-//   - 网络层失败（连接错误、超时）→ 不写标记，保持 unknown
-//     （后续请求仍按"现状即证据"默认走 Responses）
-//
-// 该方法是幂等的：重复调用会以最新探测结果覆盖标记。
-//
-// 关于失败处理：探测本身的失败不应阻塞账号创建——账号能创建/更新成功就够了，
-// 探测结果只影响后续路由优化。所有错误都仅记录日志，不向调用方传播。
+// Probe failures do not block account creation or updates.
 func (s *AccountTestService) ProbeOpenAIAPIKeyResponsesSupport(ctx context.Context, accountID int64) {
 	account, err := s.accountRepo.GetByID(ctx, accountID)
 	if err != nil {
@@ -160,7 +154,7 @@ func (s *AccountTestService) ProbeOpenAIAPIKeyResponsesSupport(ctx context.Conte
 
 	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
 	if err != nil {
-		// 网络层失败：不写标记，保持 unknown，下次重试或由网关 fallback 处理
+		s.persistOpenAIResponsesProbeResult(ctx, accountID, openai_compat.ResponsesProbeStatusDegraded, 0)
 		logger.LegacyPrintf("service.openai_probe", "probe_request_failed: account_id=%d url=%s err=%v", accountID, probeURL, err)
 		return
 	}
@@ -169,24 +163,19 @@ func (s *AccountTestService) ProbeOpenAIAPIKeyResponsesSupport(ctx context.Conte
 	// 有界排空剩余响应体:既帮助连接复用,又避免行为异常的上游用超大响应体拖住探测。
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, responsesProbeMaxBodyBytes))
 	if readErr != nil {
-		// 响应体读取失败(部分读取/传输错误):按网络层失败处理,保持 unknown,
-		// 不写标记——否则可能给一个 2xx 响应误写 supported=false。
+		s.persistOpenAIResponsesProbeResult(ctx, accountID, openai_compat.ResponsesProbeStatusDegraded, resp.StatusCode)
 		logger.LegacyPrintf("service.openai_probe", "probe_read_body_failed: account_id=%d url=%s err=%v", accountID, probeURL, readErr)
 		return
 	}
 
-	supported := decideResponsesProbeSupport(resp.StatusCode, bodyBytes)
-
-	if err := s.accountRepo.UpdateExtra(ctx, accountID, map[string]any{
-		openai_compat.ExtraKeyResponsesSupported: supported,
-	}); err != nil {
-		logger.LegacyPrintf("service.openai_probe", "probe_persist_failed: account_id=%d supported=%v err=%v", accountID, supported, err)
+	probeStatus := decideResponsesProbeStatus(resp.StatusCode, bodyBytes)
+	if !s.persistOpenAIResponsesProbeResult(ctx, accountID, probeStatus, resp.StatusCode) {
 		return
 	}
 
 	logger.LegacyPrintf("service.openai_probe",
-		"probe_done: account_id=%d base_url=%s probe_model=%s status=%d supported=%v",
-		accountID, normalizedBaseURL, probeModel, resp.StatusCode, supported,
+		"probe_done: account_id=%d base_url=%s probe_model=%s status=%d probe_status=%s",
+		accountID, normalizedBaseURL, probeModel, resp.StatusCode, probeStatus,
 	)
 }
 
@@ -208,23 +197,36 @@ func isResponsesEndpointSupportedByStatus(status int) bool {
 	return true
 }
 
-// decideResponsesProbeSupport 依据探测响应判定上游 /v1/responses 是否真正可用于
-// 携带工具的请求。
-//
-//   - 404 / 405：端点不存在 → false
-//   - 其他非 2xx（401/403/422/5xx 等）：端点存在,但本次无法判定工具能力
-//     （鉴权/校验/瞬时故障）→ 保守按 true,保持既有"端点存在即支持"行为
-//   - 2xx：探测以 tool_choice=required 强制工具调用,响应必须含 function_call
-//     输出项才算真正可用;否则(如火山方舟 coding/v3 × kimi-k2.6 仅回 reasoning)
-//     判为 false,使网关改走 /v1/chat/completions 直转路径。
-func decideResponsesProbeSupport(status int, body []byte) bool {
-	if status == http.StatusNotFound || status == http.StatusMethodNotAllowed {
+func (s *AccountTestService) persistOpenAIResponsesProbeResult(
+	ctx context.Context,
+	accountID int64,
+	status openai_compat.ResponsesProbeStatus,
+	httpStatus int,
+) bool {
+	if err := s.accountRepo.UpdateExtra(ctx, accountID, map[string]any{
+		openai_compat.ExtraKeyResponsesProbeStatus:     string(status),
+		openai_compat.ExtraKeyResponsesProbeHTTPStatus: httpStatus,
+		openai_compat.ExtraKeyResponsesProbeCheckedAt:  time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		logger.LegacyPrintf("service.openai_probe", "probe_persist_failed: account_id=%d probe_status=%s err=%v", accountID, status, err)
 		return false
 	}
-	if status < 200 || status >= 300 {
-		return true
+	return true
+}
+
+func decideResponsesProbeStatus(status int, body []byte) openai_compat.ResponsesProbeStatus {
+	if status >= 200 && status < 300 {
+		if responsesProbeBodyHasFunctionCall(body) {
+			return openai_compat.ResponsesProbeStatusVerified
+		}
+		return openai_compat.ResponsesProbeStatusUnsupported
 	}
-	return responsesProbeBodyHasFunctionCall(body)
+	switch status {
+	case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented:
+		return openai_compat.ResponsesProbeStatusUnsupported
+	default:
+		return openai_compat.ResponsesProbeStatusDegraded
+	}
 }
 
 // responsesProbeBodyHasFunctionCall 判断非流式 Responses 响应体的 output 数组里

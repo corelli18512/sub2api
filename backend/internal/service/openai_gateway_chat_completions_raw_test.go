@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -589,6 +590,7 @@ func TestForwardAsChatCompletions_UnknownResponsesSupportFallbackUsesVersionedCh
 		httpUpstream: upstream,
 	}
 	account := rawChatCompletionsTestAccount()
+	account.Extra = nil
 	account.Credentials["base_url"] = "https://open.bigmodel.cn/api/paas/v4"
 
 	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "")
@@ -666,6 +668,7 @@ func rawChatCompletionsTestAccount() *Account {
 			"api_key":  "sk-test",
 			"base_url": "http://upstream.example",
 		},
+		Extra: map[string]any{openai_compat.ExtraKeyResponsesSupported: true},
 	}
 }
 
