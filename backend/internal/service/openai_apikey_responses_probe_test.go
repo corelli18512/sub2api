@@ -46,10 +46,13 @@ func TestProbeOpenAIAPIKeyResponsesSupportUsesCodexProbeHeaders(t *testing.T) {
 	require.Equal(t, "https://compat-upstream.example/v1/responses", upstream.lastReq.URL.String())
 	requireOpenAICodexProbeHeaders(t, upstream.lastReq.Header)
 	updates := <-updateCalls
-	require.Equal(t, true, updates[openai_compat.ExtraKeyResponsesSupported])
+	require.Equal(t, string(openai_compat.ResponsesProbeStatusVerified), updates[openai_compat.ExtraKeyResponsesProbeStatus])
+	require.Equal(t, http.StatusOK, updates[openai_compat.ExtraKeyResponsesProbeHTTPStatus])
+	require.NotEmpty(t, updates[openai_compat.ExtraKeyResponsesProbeCheckedAt])
+	require.NotContains(t, updates, openai_compat.ExtraKeyResponsesSupported)
 }
 
-func TestDecideResponsesProbeSupport(t *testing.T) {
+func TestDecideResponsesProbeStatus(t *testing.T) {
 	fnCall := []byte(`{"output":[{"type":"reasoning"},{"type":"function_call","name":"probe_ping"}]}`)
 	reasoningOnly := []byte(`{"output":[{"type":"reasoning"}]}`)
 
@@ -57,25 +60,26 @@ func TestDecideResponsesProbeSupport(t *testing.T) {
 		name   string
 		status int
 		body   []byte
-		want   bool
+		want   openai_compat.ResponsesProbeStatus
 	}{
 		// Endpoint clearly absent on third-party OpenAI-compatible upstreams.
-		{"404 endpoint absent", 404, fnCall, false},
-		{"405 method not allowed", 405, fnCall, false},
+		{"404 endpoint absent", 404, fnCall, openai_compat.ResponsesProbeStatusUnsupported},
+		{"405 method not allowed", 405, fnCall, openai_compat.ResponsesProbeStatusUnsupported},
+		{"501 not implemented", 501, fnCall, openai_compat.ResponsesProbeStatusUnsupported},
 		// 2xx: tool capability is judged by presence of a function_call output item.
-		{"200 with function_call", 200, fnCall, true},
+		{"200 with function_call", 200, fnCall, openai_compat.ResponsesProbeStatusVerified},
 		// Volcengine Ark coding/v3 × kimi-k2.6: reasoning only, no function_call.
-		{"200 reasoning only", 200, reasoningOnly, false},
-		{"200 invalid json", 200, []byte("not-json"), false},
-		{"200 no output field", 200, []byte(`{"status":"completed"}`), false},
-		// Non-2xx (other than 404/405): endpoint exists, capability undecidable -> conservative true.
-		{"400 conservative true", 400, reasoningOnly, true},
-		{"401 conservative true", 401, nil, true},
-		{"500 conservative true", 500, nil, true},
+		{"200 reasoning only", 200, reasoningOnly, openai_compat.ResponsesProbeStatusUnsupported},
+		{"200 invalid json", 200, []byte("not-json"), openai_compat.ResponsesProbeStatusUnsupported},
+		{"200 no output field", 200, []byte(`{"status":"completed"}`), openai_compat.ResponsesProbeStatusUnsupported},
+		// Inconclusive non-2xx responses are degraded and never auto-enable routing.
+		{"400 degraded", 400, reasoningOnly, openai_compat.ResponsesProbeStatusDegraded},
+		{"401 degraded", 401, nil, openai_compat.ResponsesProbeStatusDegraded},
+		{"500 degraded", 500, nil, openai_compat.ResponsesProbeStatusDegraded},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, decideResponsesProbeSupport(tc.status, tc.body))
+			require.Equal(t, tc.want, decideResponsesProbeStatus(tc.status, tc.body))
 		})
 	}
 }

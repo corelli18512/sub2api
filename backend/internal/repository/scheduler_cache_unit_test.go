@@ -309,6 +309,10 @@ func TestBuildSchedulerMetadataAccount_KeepsOpenAIWSFlags(t *testing.T) {
 			"openai_ws_force_http":                         true,
 			"openai_responses_mode":                        "force_chat_completions",
 			"openai_responses_supported":                   false,
+			"use_responses_api":                            true,
+			"openai_responses_probe_status":                "degraded",
+			"openai_responses_probe_http_status":           500,
+			"openai_responses_probe_checked_at":            "2026-08-17T00:00:00Z",
 			"mixed_scheduling":                             true,
 			"unused_large_field":                           "drop-me",
 		},
@@ -321,6 +325,10 @@ func TestBuildSchedulerMetadataAccount_KeepsOpenAIWSFlags(t *testing.T) {
 	require.Equal(t, true, got.Extra["openai_ws_force_http"])
 	require.Equal(t, "force_chat_completions", got.Extra["openai_responses_mode"])
 	require.Equal(t, false, got.Extra["openai_responses_supported"])
+	require.Equal(t, true, got.Extra["use_responses_api"])
+	require.Equal(t, "degraded", got.Extra["openai_responses_probe_status"])
+	require.Equal(t, 500, got.Extra["openai_responses_probe_http_status"])
+	require.Equal(t, "2026-08-17T00:00:00Z", got.Extra["openai_responses_probe_checked_at"])
 	require.Equal(t, true, got.Extra["mixed_scheduling"])
 	require.Nil(t, got.Extra["unused_large_field"])
 }

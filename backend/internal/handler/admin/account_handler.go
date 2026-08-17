@@ -24,6 +24,7 @@ import (
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/geminicli"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
@@ -806,6 +807,7 @@ func (h *AccountHandler) Create(c *gin.Context) {
 	}
 	// base_rpm 输入校验：负值归零，超过 10000 截断
 	sanitizeExtraBaseRPM(req.Extra)
+	req.Extra = defaultOpenAIAPIKeyResponsesCapability(req.Platform, req.Type, req.Extra)
 
 	// 确定是否跳过混合渠道检查
 	skipCheck := req.ConfirmMixedChannelRisk != nil && *req.ConfirmMixedChannelRisk
@@ -985,12 +987,32 @@ func (h *AccountHandler) Update(c *gin.Context) {
 	response.Success(c, h.buildAccountResponseWithRuntime(c.Request.Context(), account))
 }
 
+func defaultOpenAIAPIKeyResponsesCapability(platform, accountType string, extra map[string]any) map[string]any {
+	if platform != service.PlatformOpenAI || accountType != service.AccountTypeAPIKey {
+		return extra
+	}
+	if extra == nil {
+		extra = make(map[string]any)
+	}
+	if _, ok := extra[openai_compat.ExtraKeyResponsesMode]; ok {
+		return extra
+	}
+	if _, ok := extra[openai_compat.ExtraKeyResponsesSupported]; ok {
+		return extra
+	}
+	if _, ok := extra[openai_compat.ExtraKeyLegacyUseResponsesAPI]; ok {
+		return extra
+	}
+	extra[openai_compat.ExtraKeyResponsesSupported] = false
+	return extra
+}
+
 // scheduleOpenAIResponsesProbe 异步触发 OpenAI APIKey 账号的 Responses API 能力探测。
 //
 // 仅对 platform=openai && type=apikey 账号生效；其他账号无操作。
 // 探测本身在 goroutine 中执行（会发一次 HTTP 请求到上游），不会阻塞
-// 当前请求。探测错误仅记录日志，不向上下文传播：探测失败时标记保持缺失，
-// 网关会按"现状即证据"默认走 Responses。
+// 当前请求。探测错误仅记录日志，不向上下文传播；探测结果只用于能力报告，
+// 不会覆盖管理员显式配置，也不会自动启用 Responses 路由。
 func (h *AccountHandler) scheduleOpenAIResponsesProbe(account *service.Account) {
 	if account == nil || account.Platform != service.PlatformOpenAI || account.Type != service.AccountTypeAPIKey {
 		return
@@ -1702,6 +1724,7 @@ func (h *AccountHandler) BatchCreate(c *gin.Context) {
 
 			// base_rpm 输入校验：负值归零，超过 10000 截断
 			sanitizeExtraBaseRPM(item.Extra)
+			item.Extra = defaultOpenAIAPIKeyResponsesCapability(item.Platform, item.Type, item.Extra)
 
 			skipCheck := item.ConfirmMixedChannelRisk != nil && *item.ConfirmMixedChannelRisk
 
