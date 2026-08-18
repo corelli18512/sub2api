@@ -218,12 +218,13 @@ jobs:
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" \
+            -v "${GITHUB_WORKSPACE}/.trivyignore:/work/.trivyignore:ro" \
             aquasec/trivy:0.65.0 image \
             --db-repository ghcr.io/aquasecurity/trivy-db:2 \
             --skip-version-check \
             --scanners vuln \
             --ignore-unfixed \
-            --ignorefile .trivyignore \
+            --ignorefile /work/.trivyignore \
             --severity HIGH,CRITICAL \
             --exit-code 1 \
             "${IMAGE}:${GITHUB_SHA}-amd64"
@@ -313,12 +314,13 @@ jobs:
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" \
+            -v "${GITHUB_WORKSPACE}/.trivyignore:/work/.trivyignore:ro" \
             aquasec/trivy:0.65.0 image \
             --db-repository ghcr.io/aquasecurity/trivy-db:2 \
             --skip-version-check \
             --scanners vuln \
             --ignore-unfixed \
-            --ignorefile .trivyignore \
+            --ignorefile /work/.trivyignore \
             --severity HIGH,CRITICAL \
             --exit-code 1 \
             "${IMAGE}:${GITHUB_SHA}"
