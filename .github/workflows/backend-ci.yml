@@ -1,78 +1,357 @@
-name: CI
+name: Marketplace Sub2API CI
 
 on:
   push:
+    branches: [marketplace-ebfaf249]
   pull_request:
+    branches: [marketplace-ebfaf249]
+  workflow_dispatch:
+
+concurrency:
+  group: marketplace-sub2api-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  shell:
-    runs-on: macos-15
+  verify-backend:
+    name: Verify backend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
-      - name: Check deployment scripts
-        run: |
-          /bin/bash -n deploy/apple-container.sh
-          /bin/bash deploy/tests/apple-container-test.sh
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
           go-version-file: backend/go.mod
           check-latest: false
           cache: true
           cache-dependency-path: backend/go.sum
+
       - name: Verify Go version
+        run: go version | grep -q 'go1.26.6'
+
+      - name: Check changed Go formatting
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
-          go version | grep -q 'go1.26.5'
-      - name: Unit tests
-        working-directory: backend
-        run: make test-unit
-      - name: Integration tests
-        working-directory: backend
-        run: make test-integration
+          set -euo pipefail
+          base="$EVENT_BASE_SHA"
+          if [[ -z "$base" || "$base" =~ ^0+$ ]] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base=$(git rev-parse HEAD^)
+          fi
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMRT "$base" "$GITHUB_SHA" -- 'backend/**/*.go')
+          if ((${#files[@]} == 0)); then
+            echo 'No changed Go files.'
+            exit 0
+          fi
+          unformatted=$(gofmt -l "${files[@]}")
+          if [[ -n "$unformatted" ]]; then
+            printf 'gofmt is required for:\n%s\n' "$unformatted" >&2
+            exit 1
+          fi
 
-  frontend:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: '20'
-          cache: 'pnpm'
-          cache-dependency-path: frontend/pnpm-lock.yaml
-      - name: Install frontend dependencies
-        working-directory: frontend
-        run: pnpm install --frozen-lockfile
-      - name: Frontend typecheck and critical vitest
-        run: make test-frontend
+      - name: Vet backend
+        working-directory: backend
+        run: go vet ./...
 
-  golangci-lint:
-    runs-on: ubuntu-latest
+      - name: Run backend tests
+        working-directory: backend
+        run: go test ./... -count=1
+
+      - name: Run unit-tag suite
+        working-directory: backend
+        run: go test -tags=unit ./... -count=1
+
+      - name: Run deterministic integration-tag suite
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          mapfile -t packages < <(go list -tags=integration ./... | grep -v '/internal/pkg/tlsfingerprint$')
+          go test -tags=integration -count=1 "${packages[@]}"
+
+      - name: Check deployment entrypoint
+        run: bash -n deploy/docker-entrypoint.sh deploy/ci-smoke-image.sh
+
+      - name: Enforce image-scan exception expiry
+        run: |
+          set -euo pipefail
+          today=$(date -u +%F)
+          expiry=2026-10-06
+          [[ "$today" < "$expiry" ]] || {
+            echo "SheetJS image-scan exceptions expired on $expiry" >&2
+            exit 1
+          }
+          grep -qx 'CVE-2023-30533' .trivyignore
+          grep -qx 'GHSA-4r6h-8v6p-xvw6' .trivyignore
+          grep -qx 'CVE-2024-22363' .trivyignore
+          grep -qx 'GHSA-5pgg-2g8v-p4x9' .trivyignore
+
+  lint-backend:
+    name: Lint backend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
           go-version-file: backend/go.mod
           check-latest: false
           cache: true
           cache-dependency-path: backend/go.sum
-      - name: Verify Go version
-        run: |
-          go version | grep -q 'go1.26.5'
-      - name: golangci-lint
+
+      - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.9
           args: --timeout=30m
           working-directory: backend
+
+  verify-frontend:
+    name: Verify frontend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.9
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        env:
+          NODE_ENV: development
+        run: pnpm install --frozen-lockfile --prod=false
+
+      - name: Lint frontend
+        working-directory: frontend
+        env:
+          NODE_ENV: development
+        run: pnpm run lint:check
+
+      - name: Typecheck frontend
+        working-directory: frontend
+        env:
+          NODE_ENV: development
+        run: pnpm run typecheck
+
+      - name: Run critical frontend tests
+        env:
+          NODE_ENV: test
+        run: make test-frontend-critical
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          NODE_ENV: production
+        run: pnpm run build
+
+  amd64-image:
+    name: Build and scan AMD64 image
+    if: github.event_name != 'pull_request'
+    needs: [verify-backend, lint-backend, verify-frontend]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build native AMD64 image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}-amd64
+            ${{ env.IMAGE }}:marketplace-ebfaf249-amd64
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            VERSION=marketplace-${{ github.sha }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=sub2api-amd64
+          cache-to: type=gha,mode=max,scope=sub2api-amd64
+
+      - name: PostgreSQL and Redis runtime smoke test
+        run: bash deploy/ci-smoke-image.sh "${IMAGE}:${GITHUB_SHA}-amd64" amd64
+
+      - name: Scan image vulnerabilities
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" \
+            aquasec/trivy:0.65.0 image \
+            --db-repository ghcr.io/aquasecurity/trivy-db:2 \
+            --skip-version-check \
+            --scanners vuln \
+            --ignore-unfixed \
+            --ignorefile .trivyignore \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            "${IMAGE}:${GITHUB_SHA}-amd64"
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            anchore/syft:v1.29.0 \
+            "${IMAGE}:${GITHUB_SHA}-amd64" -o cyclonedx-json \
+            > "sbom-${GITHUB_SHA}-amd64.cdx.json"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom-${{ github.sha }}-amd64
+          path: sbom-${{ github.sha }}-amd64.cdx.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Push immutable AMD64 image
+        run: |
+          set -euo pipefail
+          docker push "${IMAGE}:${GITHUB_SHA}-amd64"
+          docker push "${IMAGE}:marketplace-ebfaf249-amd64"
+          digest="sha256:$(docker buildx imagetools inspect "${IMAGE}:${GITHUB_SHA}-amd64" --raw | sha256sum | awk '{print $1}')"
+          printf '%s@%s\n' "$IMAGE" "$digest" | tee "sub2api-image-${GITHUB_SHA}-amd64.txt"
+          printf '### AMD64 image\n`%s@%s`\n' "$IMAGE" "$digest" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload immutable image reference
+        uses: actions/upload-artifact@v7
+        with:
+          name: sub2api-image-${{ github.sha }}-amd64
+          path: sub2api-image-${{ github.sha }}-amd64.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  arm64-image:
+    name: Build and scan ARM64 image
+    if: github.event_name != 'pull_request'
+    needs: [verify-backend, lint-backend, verify-frontend]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build native ARM64 image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          push: false
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:marketplace-ebfaf249
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            VERSION=marketplace-${{ github.sha }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=sub2api-arm64
+          cache-to: type=gha,mode=max,scope=sub2api-arm64
+
+      - name: PostgreSQL and Redis runtime smoke test
+        run: bash deploy/ci-smoke-image.sh "${IMAGE}:${GITHUB_SHA}" arm64
+
+      - name: Scan image vulnerabilities
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" \
+            aquasec/trivy:0.65.0 image \
+            --db-repository ghcr.io/aquasecurity/trivy-db:2 \
+            --skip-version-check \
+            --scanners vuln \
+            --ignore-unfixed \
+            --ignorefile .trivyignore \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            "${IMAGE}:${GITHUB_SHA}"
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            anchore/syft:v1.29.0 \
+            "${IMAGE}:${GITHUB_SHA}" -o cyclonedx-json \
+            > "sbom-${GITHUB_SHA}.cdx.json"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom-${{ github.sha }}.cdx.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Push immutable ARM64 image
+        run: |
+          set -euo pipefail
+          docker push "${IMAGE}:${GITHUB_SHA}"
+          docker push "${IMAGE}:marketplace-ebfaf249"
+          digest="sha256:$(docker buildx imagetools inspect "${IMAGE}:${GITHUB_SHA}" --raw | sha256sum | awk '{print $1}')"
+          printf '%s@%s\n' "$IMAGE" "$digest" | tee "sub2api-image-${GITHUB_SHA}-arm64.txt"
+          printf '### ARM64 image\n`%s@%s`\n' "$IMAGE" "$digest" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload immutable image reference
+        uses: actions/upload-artifact@v7
+        with:
+          name: sub2api-image-${{ github.sha }}-arm64
+          path: sub2api-image-${{ github.sha }}-arm64.txt
+          if-no-files-found: error
+          retention-days: 30
