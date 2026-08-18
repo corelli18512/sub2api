@@ -34,7 +34,7 @@ jobs:
           cache-dependency-path: backend/go.sum
 
       - name: Verify Go version
-        run: go version | grep -q 'go1.26.5'
+        run: go version | grep -q 'go1.26.6'
 
       - name: Check changed Go formatting
         env:
@@ -77,7 +77,21 @@ jobs:
           go test -tags=integration -count=1 "${packages[@]}"
 
       - name: Check deployment entrypoint
-        run: bash -n deploy/docker-entrypoint.sh
+        run: bash -n deploy/docker-entrypoint.sh deploy/ci-smoke-image.sh
+
+      - name: Enforce image-scan exception expiry
+        run: |
+          set -euo pipefail
+          today=$(date -u +%F)
+          expiry=2026-10-06
+          [[ "$today" < "$expiry" ]] || {
+            echo "SheetJS image-scan exceptions expired on $expiry" >&2
+            exit 1
+          }
+          grep -qx 'CVE-2023-30533' .trivyignore
+          grep -qx 'GHSA-4r6h-8v6p-xvw6' .trivyignore
+          grep -qx 'CVE-2024-22363' .trivyignore
+          grep -qx 'GHSA-5pgg-2g8v-p4x9' .trivyignore
 
   lint-backend:
     name: Lint backend
@@ -209,6 +223,7 @@ jobs:
             --skip-version-check \
             --scanners vuln \
             --ignore-unfixed \
+            --ignorefile .trivyignore \
             --severity HIGH,CRITICAL \
             --exit-code 1 \
             "${IMAGE}:${GITHUB_SHA}-amd64"
@@ -303,6 +318,7 @@ jobs:
             --skip-version-check \
             --scanners vuln \
             --ignore-unfixed \
+            --ignorefile .trivyignore \
             --severity HIGH,CRITICAL \
             --exit-code 1 \
             "${IMAGE}:${GITHUB_SHA}"
