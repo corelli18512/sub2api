@@ -80,5 +80,5 @@ done
 
 test "$(docker image inspect "$image" --format '{{.Architecture}}')" = "$expected_arch"
 docker exec "$app" sh -c "awk '/^Uid:/{exit !(\$2 == 1000)}' /proc/1/status"
-docker exec "$app" sh -c "grep -q '\"ok\":true' /tmp/health.json"
+docker exec "$app" sh -c "grep -q '\"status\":\"ok\"' /tmp/health.json"
 docker exec --user 1000 "$app" /app/sub2api --version
